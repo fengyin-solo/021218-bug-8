@@ -1,8 +1,14 @@
 /**
  * PDF 渲染引擎 — 基于 PDF.js 2.10.377
- * PDF.js 通过 index.html 中的 <script> 标签加载到 window.pdfjsLib
+ * PDF.js 不再由 index.html 写死 <script src="/pdfjs/pdf.js"> 引入，
+ * 而是在下方按 pdf-config 解析出的地址动态注入：
+ *   - 自动跟随部署目录（根目录 / 子目录均可）
+ *   - 可在「资源设置」中覆盖，改完立即重新加载
+ *   - 加载失败暴露明确错误与重试入口，不再无限等待
  * 2.x UMD 版本无 private class fields，彻底避免 Vite 兼容性问题
  */
+import { reactive, watch } from 'vue'
+import { pdfResourceConfig } from './pdf-config'
 
 /* ------------------------------------------------------------------ */
 /*  PDF.js 2.x 类型定义（无需 @types/pdfjs-dist，手动声明核心接口）       */
@@ -99,55 +105,233 @@ interface PdfjsLinkService {
   isInPresentationMode: boolean
 }
 
+/** PDF.js UMD 全局库（2.10.377） */
+export interface PdfjsLib {
+  GlobalWorkerOptions: { workerSrc: string }
+  getDocument(params: Record<string, unknown>): { promise: Promise<PdfjsDocument> }
+  renderTextLayer(params: {
+    textContent: PdfjsTextContent
+    container: HTMLDivElement
+    viewport: PdfjsViewport
+    enhanceTextSelection?: boolean
+  }): void
+  AnnotationLayer: {
+    render(params: {
+      annotations: PdfjsAnnotation[]
+      div: HTMLDivElement
+      page: PdfjsPage
+      viewport: PdfjsViewport
+      linkService: PdfjsLinkService
+    }): void
+  }
+}
+
 declare global {
   interface Window {
-    pdfjsLib?: {
-      GlobalWorkerOptions: { workerSrc: string }
-      getDocument(params: Record<string, unknown>): { promise: Promise<PdfjsDocument> }
-      renderTextLayer(params: {
-        textContent: PdfjsTextContent
-        container: HTMLDivElement
-        viewport: PdfjsViewport
-        enhanceTextSelection?: boolean
-      }): void
-      AnnotationLayer: {
-        render(params: {
-          annotations: PdfjsAnnotation[]
-          div: HTMLDivElement
-          page: PdfjsPage
-          viewport: PdfjsViewport
-          linkService: PdfjsLinkService
-        }): void
-      }
-    }
+    pdfjsLib?: PdfjsLib
   }
 }
 
 /* ------------------------------------------------------------------ */
-/*  初始化                                                              */
+/*  PDF.js 动态加载（跟随部署位置 / 可被设置覆盖 / 失败可重试）             */
 /* ------------------------------------------------------------------ */
 
-let _resolve: () => void
-const pdfjsReady = new Promise<void>((resolve) => {
-  _resolve = resolve
-})
+export type EnginePhase = 'idle' | 'loading' | 'ready' | 'error'
 
-if (window.pdfjsLib) {
-  _resolve!()
-} else {
-  window.addEventListener('pdfjs-ready', () => _resolve(), { once: true })
+interface EngineState {
+  phase: EnginePhase
+  /** 当前生效的脚本地址 */
+  scriptUrl: string
+  /** 失败说明（phase === 'error' 时） */
+  errorMsg: string
+  /** 加载序号，丢弃过期的加载结果 */
+  loadSeq: number
 }
 
-function getPdfjs() {
+const engine = reactive<EngineState>({
+  phase: 'idle',
+  scriptUrl: pdfResourceConfig.effectiveUrls.scriptUrl,
+  errorMsg: '',
+  loadSeq: 0,
+})
+
+export const engineState: Readonly<EngineState> = engine
+
+/**
+ * 已打开页面与其加载时所用的 PDF.js 版本的绑定。
+ * 设置里更换脚本地址后会重新注入 PDF.js，旧文档的页面仍用旧 lib 渲染，
+ * 保证「已经打开的文档不受影响」。
+ */
+const pageLibs = new WeakMap<PdfjsPage, PdfjsLib>()
+
+let activeLib: PdfjsLib | undefined
+
+function describeError(e: unknown): string {
+  if (e instanceof Event) return '脚本加载失败（网络错误或地址 404）'
+  if (e instanceof Error) {
+    if (e.message === 'PDFJS_SCRIPT_TIMEOUT') {
+      return '脚本加载超时：地址不可达或响应过慢，请检查"PDF.js 脚本地址"'
+    }
+    if (e.message === 'PDFJS_SCRIPT_INVALID') {
+      return '脚本已下载但不是有效的 PDF.js（地址可能返回了 HTML 页面），请检查"PDF.js 脚本地址"'
+    }
+    return e.message
+  }
+  return String(e)
+}
+
+/** 注入并加载指定地址的 PDF.js 脚本 */
+function injectPdfjsScript(url: string, previous?: PdfjsLib): Promise<PdfjsLib> {
+  return new Promise((resolve, reject) => {
+    // 重新加载时移除旧的 <script>，避免重复与全局残留造成误判
+    document.querySelectorAll('script[data-pdfjs-lib]').forEach((el) => el.remove())
+
+    const script = document.createElement('script')
+    script.src = url
+    script.async = true
+    script.dataset.pdfjsLib = 'true'
+
+    const timer = setTimeout(() => {
+      cleanup()
+      reject(new Error('PDFJS_SCRIPT_TIMEOUT'))
+    }, 15000)
+
+    function cleanup() {
+      clearTimeout(timer)
+      script.removeEventListener('load', onLoad)
+      script.removeEventListener('error', onError)
+    }
+    function onLoad() {
+      cleanup()
+      const lib = window.pdfjsLib
+      if (!lib || typeof lib.getDocument !== 'function') {
+        reject(new Error('PDFJS_SCRIPT_INVALID'))
+        return
+      }
+      // UMD 每次执行都会赋一个全新对象；若拿到的还是旧引用，
+      // 说明下载的不是 PDF.js（例如 SPA 回退返回的 HTML 之外的普通 JS）
+      if (previous && lib === previous) {
+        reject(new Error('PDFJS_SCRIPT_INVALID'))
+        return
+      }
+      resolve(lib)
+    }
+    function onError() {
+      cleanup()
+      reject(new Event('error'))
+    }
+
+    script.addEventListener('load', onLoad)
+    script.addEventListener('error', onError)
+    document.head.appendChild(script)
+  })
+}
+
+let currentLoad: Promise<void> = Promise.resolve()
+
+/**
+ * 按当前配置加载（或重新加载）PDF.js。
+ */
+function loadPdfjs(): Promise<void> {
+  const seq = ++engine.loadSeq
+  const urls = pdfResourceConfig.effectiveUrls
+  engine.scriptUrl = urls.scriptUrl
+  engine.phase = 'loading'
+  engine.errorMsg = ''
+
+  // 保住旧 lib：脚本地址切换失败时，已打开的文档仍可继续使用
+  const oldLib = window.pdfjsLib
+
+  const load = (async () => {
+    let lib: PdfjsLib
+    try {
+      lib = await injectPdfjsScript(urls.scriptUrl, oldLib)
+    } catch (e) {
+      if (seq !== engine.loadSeq) return
+      const msg = describeError(e)
+      engine.phase = 'error'
+      engine.errorMsg = msg
+      pdfResourceConfig.setResourceStatus('scriptUrl', 'fail', msg)
+      // 失败回退：热更新前已打开的文档继续用旧 lib，不受坏地址影响
+      if (oldLib) window.pdfjsLib = oldLib
+      return
+    }
+    if (seq !== engine.loadSeq) return
+
+    lib.GlobalWorkerOptions.workerSrc = urls.workerUrl
+    activeLib = lib
+    window.pdfjsLib = lib
+
+    engine.phase = 'ready'
+    engine.errorMsg = ''
+    pdfResourceConfig.setResourceStatus('scriptUrl', 'ok', '脚本加载成功')
+    // worker / cmaps / 字体为静态文件，后台探活以在设置面板标注是否真的可取到
+    void pdfResourceConfig.checkStaticResources()
+  })()
+
+  currentLoad = load
+  return load
+}
+
+/** 设置面板点击"重试" */
+export function retryLoadPdfjs(): Promise<void> {
+  return loadPdfjs()
+}
+
+async function ensureReady(): Promise<PdfjsLib> {
+  await currentLoad
+  if (engine.phase === 'loading') {
+    // currentLoad 已 settle 但仍处于 loading 不会发生；保险等待下一帧轮询
+    await new Promise((r) => setTimeout(r, 0))
+    return ensureReady()
+  }
+  const lib = window.pdfjsLib
+  if (engine.phase !== 'ready' || !lib) {
+    throw new Error(engine.errorMsg || 'PDF.js 未就绪，请检查资源设置后重试')
+  }
+  return lib
+}
+
+function getPdfjs(): PdfjsLib {
   const lib = window.pdfjsLib
   if (!lib) throw new Error('PDF.js not loaded')
   return lib
 }
 
-async function ensureReady() {
-  await pdfjsReady
-  return getPdfjs()
+/** 取文档/页面绑定的 lib（热更新前打开的文档继续走旧版本） */
+function libForPage(page: PdfjsPage): PdfjsLib {
+  return pageLibs.get(page) || activeLib || getPdfjs()
 }
+
+// 监听配置变化：保存设置后立即生效
+watch(
+  () => pdfResourceConfig.state.configVersion,
+  async () => {
+    const urls = pdfResourceConfig.effectiveUrls
+    const currentScript = engine.scriptUrl
+
+    if (urls.scriptUrl === currentScript && engine.phase === 'ready') {
+      // 脚本未变：worker 地址立即切换（旧文档的在途任务不受影响）
+      const lib = window.pdfjsLib
+      if (lib) lib.GlobalWorkerOptions.workerSrc = urls.workerUrl
+      // cMap/字体地址在 loadPdfDocument 时实时读取，天然对新文档生效
+      void pdfResourceConfig.checkStaticResources()
+      return
+    }
+
+    if (urls.scriptUrl === currentScript) {
+      // 脚本地址未变但引擎处于失败态：重新注入同一脚本（等价于重试）
+      await loadPdfjs()
+      return
+    }
+
+    // 脚本地址变了：重新注入；失败会自动回退旧 lib，已打开文档照常工作
+    await loadPdfjs()
+  },
+)
+
+// 启动即按部署位置自动加载
+void loadPdfjs()
 
 /* ------------------------------------------------------------------ */
 /*  导出接口                                                            */
@@ -159,20 +343,31 @@ export interface PageRenderResult {
   viewport: PdfjsViewport
 }
 
-/** 预加载（等待 PDF.js 就绪） */
+/** 预加载（等待 PDF.js 就绪）；失败时抛错由界面展示并提供重试 */
 export async function preloadPdfjs(): Promise<void> {
   await ensureReady()
 }
 
-/** 加载 PDF 文档 */
+/** 加载 PDF 文档（cMap / 标准字体地址实时取自资源配置，设置改变后对新文档立即生效） */
 export async function loadPdfDocument(url: string): Promise<PdfjsDocument> {
   const pdfjs = await ensureReady()
-  return pdfjs.getDocument({
+  const urls = pdfResourceConfig.effectiveUrls
+  const doc = await pdfjs.getDocument({
     url,
-    cMapUrl: '/pdfjs/cmaps/',
+    cMapUrl: urls.cMapUrl,
     cMapPacked: true,
-    standardFontDataUrl: '/pdfjs/standard_fonts/',
+    standardFontDataUrl: urls.standardFontDataUrl,
   }).promise
+
+  // 绑定本次加载所用的 lib：之后即便脚本地址被改掉、PDF.js 被重新注入，
+  // 这份文档的页面仍用旧 lib 渲染文本/注释层，已打开文档不受影响。
+  const rawGetPage = doc.getPage.bind(doc)
+  doc.getPage = async (pageNumber: number) => {
+    const page = await rawGetPage(pageNumber)
+    if (!pageLibs.has(page)) pageLibs.set(page, pdfjs)
+    return page
+  }
+  return doc
 }
 
 /** 渲染单页到 Canvas */
@@ -198,7 +393,7 @@ export async function renderPageToCanvas(
 export async function buildTextLayer(
   page: PdfjsPage, container: HTMLDivElement, viewport: PdfjsViewport,
 ): Promise<void> {
-  const pdfjs = getPdfjs()
+  const pdfjs = libForPage(page)
   const textContent = await page.getTextContent()
   container.innerHTML = ''
   container.style.width = `${viewport.width}px`
@@ -218,7 +413,7 @@ export async function buildTextLayer(
 export async function buildAnnotationLayer(
   page: PdfjsPage, container: HTMLDivElement, viewport: PdfjsViewport,
 ): Promise<void> {
-  const pdfjs = getPdfjs()
+  const pdfjs = libForPage(page)
   const annotations = await page.getAnnotations()
   if (!annotations.length) return
   container.innerHTML = ''

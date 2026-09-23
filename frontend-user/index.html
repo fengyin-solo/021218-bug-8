@@ -2,18 +2,17 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="icon" type="image/svg+xml" href="./vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PDF Viewer</title>
-    <!-- PDF.js 2.10.377 UMD — 自动设置 window.pdfjsLib，零 private fields -->
-    <script src="/pdfjs/pdf.js"></script>
-    <script>
-      pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdfjs/pdf.worker.js';
-      window.dispatchEvent(new Event('pdfjs-ready'));
-    </script>
+    <!--
+      PDF.js 2.10.377 UMD 由应用启动后动态注入（见 src/utils/pdf-engine.ts），
+      脚本/worker 地址会根据当前部署目录自动解析，也可在「资源设置」中覆盖。
+      这里不再写死 /pdfjs/pdf.js，避免部署到子目录后 404 卡死。
+    -->
   </head>
   <body>
     <div id="app"></div>
-    <script type="module" src="/src/main.ts"></script>
+    <script type="module" src="./src/main.ts"></script>
   </body>
 </html>

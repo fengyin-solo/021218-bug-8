@@ -6,7 +6,7 @@
           v-for="s in sampleFiles" :key="s.name"
           class="toolbar__sample-btn"
           :class="{ 'toolbar__sample-btn--active': fileName === s.name }"
-          :disabled="loading"
+          :disabled="loading || engineError"
           @click="loadSample(s.name)"
         >{{ s.label }}</button>
         <div class="toolbar__divider" v-if="totalPages > 0" />
@@ -94,6 +94,17 @@
       </div>
       <div class="toolbar__right">
         <span class="toolbar__hint" v-if="totalPages > 0">可直接选中文字复制</span>
+        <button
+          class="toolbar__btn toolbar__settings-btn"
+          @click="showSettings = true"
+          title="资源设置（脚本 / Worker / 字符集 / 字体地址）"
+        >
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="17" height="17">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+          <span v-if="resourceHasIssue" class="toolbar__settings-dot" />
+        </button>
       </div>
     </header>
 
@@ -132,6 +143,30 @@
         </div>
       </aside>
       <div class="pdf-container" ref="containerRef" @scroll="onScroll">
+        <div class="pdf-boot" v-if="engineLoading && !pdfDoc">
+          <div class="pdf-boot__spinner"/>
+          <p class="pdf-boot__text">正在加载 PDF.js 脚本…</p>
+          <p class="pdf-boot__sub">{{ engineState.scriptUrl }}</p>
+        </div>
+        <div class="pdf-boot" v-else-if="engineError && !pdfDoc">
+          <div class="pdf-boot__card">
+            <svg class="pdf-boot__icon" viewBox="0 0 24 24" fill="none" stroke="#ff4d4f" stroke-width="2" width="40" height="40">
+              <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <p class="pdf-boot__title">PDF.js 脚本加载失败</p>
+            <p class="pdf-boot__msg">{{ engineState.errorMsg }}</p>
+            <p class="pdf-boot__url">请求地址：<code>{{ engineState.scriptUrl }}</code></p>
+            <p class="pdf-boot__hint">
+              部署到子目录时地址需随部署位置变化。可在「资源设置」中检查并覆盖脚本地址，
+              地址旁的状态标记可区分"设置尚未生效"与"地址本身取不到"。
+            </p>
+            <div class="pdf-boot__actions">
+              <button class="pdf-boot__btn pdf-boot__btn--primary" @click="retryEngine">重试加载</button>
+              <button class="pdf-boot__btn" @click="showSettings = true">打开资源设置</button>
+            </div>
+          </div>
+        </div>
+        <template v-else>
         <div class="pdf-empty" v-if="!pdfDoc && !loading">
           <label class="pdf-empty__card pdf-empty__card--clickable">
             <svg class="pdf-empty__icon" viewBox="0 0 64 64" fill="none">
@@ -174,8 +209,10 @@
             <div class="pdf-page__number">{{ pageNum }}</div>
           </div>
         </div>
+        </template>
       </div>
     </main>
+    <ResourceSettings v-model="showSettings" />
     <Transition name="toast">
       <div class="toast" v-if="toastMsg" :class="`toast--${toastType}`">{{ toastMsg }}</div>
     </Transition>
@@ -188,9 +225,14 @@ import {
   loadPdfDocument, renderPageToCanvas, buildTextLayer,
   buildAnnotationLayer, preloadPdfjs, getPageBaseDimensions,
   searchDocument, buildHighlightLayer, clearHighlightLayer,
+  retryLoadPdfjs, engineState,
   type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
   type SearchResult, type SearchMatch, type PageSearchResult,
 } from '@/utils/pdf-engine'
+import { usePdfResourceConfig, resolvePath } from '@/utils/pdf-config'
+import ResourceSettings from '@/components/ResourceSettings.vue'
+
+const { state: resourceState } = usePdfResourceConfig()
 
 const sampleFiles = [
   { name: 'sample.pdf', label: '示例一：学术论文' },
@@ -208,6 +250,28 @@ const fileName = ref('')
 const currentVisiblePage = ref(1)
 const toastMsg = ref('')
 const toastType = ref<'success' | 'error' | 'info'>('info')
+const showSettings = ref(false)
+
+/* ---- PDF.js 引擎启动状态（脚本加载失败时给说明与重试，而不是一直转圈） ---- */
+const engineLoading = computed(() => engineState.phase === 'loading' || engineState.phase === 'idle')
+const engineError = computed(() => engineState.phase === 'error')
+function retryEngine() {
+  retryLoadPdfjs()
+}
+/** 任一资源探活失败或脚本处于错误态 —— 工具栏设置按钮给出红点提示 */
+const resourceHasIssue = computed(() => {
+  if (engineState.phase === 'error') return true
+  return Object.values(resourceState.resources).some((r) => r.status === 'fail')
+})
+
+// 引擎状态变化时给出即时反馈（设置保存后立刻能看出是否生效）
+watch(() => engineState.phase, (phase, old) => {
+  if (phase === 'ready' && (old === 'loading' || old === 'error' || old === 'idle')) {
+    showToast('PDF.js 已就绪，新地址已生效', 'success')
+  } else if (phase === 'error') {
+    showToast('PDF.js 脚本加载失败，请检查资源设置', 'error')
+  }
+})
 
 const containerRef = ref<HTMLElement | null>(null)
 const searchInputRef = ref<HTMLInputElement | null>(null)
@@ -694,15 +758,22 @@ async function loadPdf(url: string) {
   } catch (e: unknown) {
     loading.value = false
     const msg = e instanceof Error ? e.message : String(e)
-    errorMsg.value = `PDF 加载失败: ${msg}`
-    showToast('加载失败', 'error')
+    if (engineError.value) {
+      // 引擎本身没起来：由启动失败卡片展示说明与重试入口，不再只弹个 toast
+      errorMsg.value = ''
+      showToast('PDF.js 未就绪，请先在资源设置中修正脚本地址', 'error')
+    } else {
+      errorMsg.value = `PDF 加载失败: ${msg}`
+      showToast('加载失败', 'error')
+    }
     console.error('PDF 加载失败:', e)
   }
 }
 
 function loadSample(name: string) {
   fileName.value = name
-  loadPdf(`/${name}`)
+  // 示例 PDF 同样跟随部署位置（子目录下不再请求站点根）
+  loadPdf(resolvePath(name, resourceState.basePath))
 }
 
 function onFileChange(e: Event) {
@@ -836,6 +907,55 @@ onUnmounted(() => {
   &__text { font-size: var(--font-size-lg); color: var(--text-primary); }
   &__sub { font-size: var(--font-size-sm); color: var(--text-tertiary); }
 }
+/* ---- 启动加载 / 失败 ---- */
+.pdf-boot {
+  display: flex; align-items: center; justify-content: center; height: 100%; padding: 48px;
+  &__spinner {
+    width: 40px; height: 40px; border: 3px solid var(--border-color);
+    border-top-color: var(--primary-color); border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  &__text { margin-top: 16px; color: var(--text-secondary); }
+  &__sub {
+    margin-top: 6px; font-size: var(--font-size-sm); color: var(--text-tertiary);
+    max-width: 560px; word-break: break-all; text-align: center;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  &__card {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    padding: 32px 48px; max-width: 560px;
+    background: var(--card-bg); border: 1px solid #ffccc7; border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-md); text-align: center;
+  }
+  &__icon { flex-shrink: 0; }
+  &__title { font-size: var(--font-size-lg); font-weight: 600; color: #cf1322; }
+  &__msg { color: #cf1322; font-size: var(--font-size-base); }
+  &__url {
+    font-size: var(--font-size-sm); color: var(--text-secondary);
+    code {
+      padding: 1px 6px; background: var(--bg-color); border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all;
+    }
+  }
+  &__hint { font-size: var(--font-size-sm); color: var(--text-tertiary); line-height: 1.7; }
+  &__actions { display: flex; gap: 12px; margin-top: 8px; }
+  &__btn {
+    padding: 7px 20px; background: var(--card-bg); border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm); cursor: pointer; font-size: var(--font-size-base);
+    color: var(--text-secondary); transition: all 0.2s;
+    &:hover { border-color: var(--primary-color); color: var(--primary-color); }
+    &--primary { background: var(--primary-color); border-color: var(--primary-color); color: #fff;
+      &:hover { background: var(--primary-hover); border-color: var(--primary-hover); } }
+  }
+}
+
+/* ---- 工具栏设置按钮 ---- */
+.toolbar__settings-btn { position: relative; }
+.toolbar__settings-dot {
+  position: absolute; top: 5px; right: 5px;
+  width: 7px; height: 7px; border-radius: 50%;
+  background: #ff4d4f; border: 1.5px solid var(--card-bg);
+}
+
 .pdf-loading {
   display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 16px;
   &__spinner {
