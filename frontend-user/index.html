@@ -2,14 +2,294 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="icon" type="image/svg+xml" href="./vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PDF Viewer</title>
-    <!-- PDF.js 2.10.377 UMD — 自动设置 window.pdfjsLib，零 private fields -->
-    <script src="/pdfjs/pdf.js"></script>
+    <!--
+      PDF.js 2.10.377 UMD 引导脚本。
+      不再写死根目录地址：基础路径默认取当前文档所在目录（部署在子目录时自动跟随），
+      用户也可在设置面板中覆盖该基础路径（保存在 localStorage）。
+      window.__PDF_VIEWER_BOOT__ 暴露状态、重试与连通性探测接口供应用层使用。
+    -->
     <script>
-      pdfjsLib.GlobalWorkerOptions.workerSrc = '/pdfjs/pdf.worker.js';
-      window.dispatchEvent(new Event('pdfjs-ready'));
+      (function () {
+        'use strict';
+
+        var STORAGE_KEY = 'pdf-viewer.base-url';
+        /* 各项资源相对基础路径的位置（public/pdfjs 下的固定布局） */
+        var SCRIPT_REL = 'pdfjs/pdf.js';
+        var WORKER_REL = 'pdfjs/pdf.worker.js';
+        var CMAP_REL = 'pdfjs/cmaps/';
+        var FONT_REL = 'pdfjs/standard_fonts/';
+
+        /** 默认基础路径：页面所在目录，部署位置变化时自动取值（根目录 / 子目录均适用） */
+        function detectedBase() {
+          var u = new URL(document.baseURI);
+          u.search = '';
+          u.hash = '';
+          var path = u.pathname;
+          if (path.charAt(path.length - 1) !== '/') {
+            u.pathname = path.substring(0, path.lastIndexOf('/') + 1);
+          }
+          return u.href;
+        }
+
+        function readOverride() {
+          try { return localStorage.getItem(STORAGE_KEY) || ''; }
+          catch (e) { return ''; }
+        }
+
+        function writeOverride(v) {
+          try {
+            if (v) localStorage.setItem(STORAGE_KEY, v);
+            else localStorage.removeItem(STORAGE_KEY);
+          } catch (e) { /* 隐私模式等场景下静默降级为仅本次会话生效 */ }
+        }
+
+        /**
+         * 规范化用户输入的基础路径：
+         * 相对路径基于当前页面地址解析，结果统一保证以 / 结尾。
+         * 非法输入抛出异常，由调用方提示。
+         */
+        function normalizeBase(input) {
+          var raw = String(input == null ? '' : input).trim();
+          if (!raw) throw new Error('基础路径不能为空');
+          var url = new URL(raw, document.baseURI);
+          url.search = '';
+          url.hash = '';
+          if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+            throw new Error('基础路径必须是 http(s) 地址');
+          }
+          var href = url.href;
+          if (href.charAt(href.length - 1) !== '/') href += '/';
+          return href;
+        }
+
+        function joinUrl(base, rel) {
+          return new URL(rel, base).href;
+        }
+
+        var detected = detectedBase();
+        var savedOverride = readOverride();
+        var overrideBase = '';
+        var overrideError = '';
+        if (savedOverride) {
+          try { overrideBase = normalizeBase(savedOverride); }
+          catch (e) { overrideError = e.message; }
+        }
+
+        /** loading | ready | error —— PDF.js 脚本自身的加载状态 */
+        var state = {
+          status: 'loading',
+          detectedBase: detected,
+          overrideBase: overrideBase,
+          overrideInput: savedOverride,
+          overrideError: overrideError,
+          effectiveBase: overrideBase || detected,
+          scriptUrl: '',
+          workerUrl: '',
+          error: '',
+          attempts: 0,
+        };
+
+        function recomputeUrls() {
+          state.scriptUrl = joinUrl(state.effectiveBase, SCRIPT_REL);
+          state.workerUrl = joinUrl(state.effectiveBase, WORKER_REL);
+        }
+        recomputeUrls();
+
+        function emit(type) {
+          window.dispatchEvent(new CustomEvent(type || 'pdf-boot-change', { detail: state }));
+        }
+
+        function applyWorker() {
+          if (window.pdfjsLib && window.pdfjsLib.GlobalWorkerOptions) {
+            window.pdfjsLib.GlobalWorkerOptions.workerSrc = state.workerUrl;
+          }
+        }
+
+        function markReady() {
+          applyWorker();
+          state.status = 'ready';
+          state.error = '';
+          emit();
+          /* 兼容旧逻辑中对 pdfjs-ready 事件的监听 */
+          window.dispatchEvent(new Event('pdfjs-ready'));
+        }
+
+        function fail(msg) {
+          if (state.status !== 'loading') return;
+          state.status = 'error';
+          state.error = msg;
+          emit();
+        }
+
+        var watchdog = null;
+
+        function loadPdfjs() {
+          state.status = 'loading';
+          state.error = '';
+          state.attempts += 1;
+          var attempt = state.attempts;
+          recomputeUrls();
+          emit();
+
+          var done = false;
+          var old = document.getElementById('pdfjs-boot-script');
+          if (old && old.parentNode) old.parentNode.removeChild(old);
+
+          var s = document.createElement('script');
+          s.id = 'pdfjs-boot-script';
+          s.async = false;
+          /* 重试同一地址时绕过缓存，避免被浏览器缓存的错误结果卡住 */
+          s.src = state.scriptUrl + (attempt > 1 ? ('?retry=' + Date.now()) : '');
+          /* 切换地址后迟到的旧响应一律忽略，避免错误地结束新一轮加载 */
+          var isCurrent = function () {
+            return attempt === state.attempts &&
+              document.getElementById('pdfjs-boot-script') === s;
+          };
+          s.onload = function () {
+            if (done || !isCurrent()) return;
+            if (!window.pdfjsLib) {
+              done = true;
+              fail('脚本已下载但未注册 pdfjsLib，地址指向的文件可能不是 PDF.js：' + state.scriptUrl);
+              return;
+            }
+            done = true;
+            if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+            markReady();
+          };
+          s.onerror = function () {
+            if (done || !isCurrent()) return;
+            done = true;
+            if (watchdog) { clearTimeout(watchdog); watchdog = null; }
+            fail('无法加载 PDF.js 脚本（HTTP 错误或网络中断）：' + state.scriptUrl);
+          };
+          document.head.appendChild(s);
+
+          if (watchdog) clearTimeout(watchdog);
+          /* 服务器不返回（挂起连接）时 onerror 可能永不触发，需有超时兜底 */
+          watchdog = setTimeout(function () {
+            if (done || !isCurrent()) return;
+            done = true;
+            fail('加载 PDF.js 脚本超时：' + state.scriptUrl);
+          }, 20000);
+        }
+
+        /**
+         * 应用用户覆盖的基础路径。空字符串表示清除覆盖、恢复自动取值。
+         * 返回校验后的基础路径；非法输入时写入 overrideError 并保持现状。
+         */
+        function applyOverride(input) {
+          var raw = String(input == null ? '' : input).trim();
+          if (!raw) return clearOverride();
+          var base;
+          try {
+            base = normalizeBase(raw);
+          } catch (e) {
+            state.overrideInput = raw;
+            state.overrideError = e.message;
+            emit();
+            throw e;
+          }
+          writeOverride(raw);
+          state.overrideInput = raw;
+          state.overrideBase = base;
+          state.overrideError = '';
+          state.effectiveBase = base;
+          recomputeUrls();
+
+          if (state.status === 'ready') {
+            /* 脚本已在内存中，无需重载；worker 等下一份文档即时使用新地址 */
+            applyWorker();
+            emit();
+          } else {
+            /* loading / error 状态：立即按新地址（重新）加载 */
+            loadPdfjs();
+          }
+          return base;
+        }
+
+        function clearOverride() {
+          writeOverride('');
+          state.overrideInput = '';
+          state.overrideBase = '';
+          state.overrideError = '';
+          state.effectiveBase = state.detectedBase;
+          recomputeUrls();
+          if (state.status === 'ready') {
+            applyWorker();
+            emit();
+          } else {
+            loadPdfjs();
+          }
+          return state.effectiveBase;
+        }
+
+        /**
+         * 连通性探测：先 HEAD，失败再用 GET 兜底（部分静态服务器不支持 HEAD）。
+         * ok / error / opaque / timeout，error 时附带 HTTP 状态码。
+         */
+        function fetchOnce(url, method) {
+          var controller = ('AbortController' in window) ? new AbortController() : null;
+          var timer = controller ? setTimeout(function () { controller.abort(); }, 8000) : null;
+          return fetch(url, { method: method, signal: controller ? controller.signal : undefined })
+            .then(function (res) {
+              if (timer) clearTimeout(timer);
+              return res;
+            })
+            .catch(function (err) {
+              if (timer) clearTimeout(timer);
+              throw err;
+            });
+        }
+
+        function probe(url) {
+          return fetchOnce(url, 'HEAD').then(function (res) {
+            if (res.ok || res.type === 'opaque') {
+              return { url: url, ok: true, status: res.status || 0, type: res.type };
+            }
+            /* HEAD 可能被服务器拒绝（403/404/405），用 GET 再试一次 */
+            return fetchOnce(url, 'GET').then(function (res2) {
+              return {
+                url: url,
+                ok: !!res2.ok,
+                status: res2.status || 0,
+                type: res2.type,
+                redirected: res2.redirected,
+              };
+            });
+          }).catch(function (err) {
+            var aborted = err && err.name === 'AbortError';
+            return {
+              url: url,
+              ok: false,
+              status: 0,
+              type: aborted ? 'timeout' : 'network',
+              message: aborted ? '请求超时（8 秒无响应）' : ((err && err.message) || '网络错误'),
+            };
+          });
+        }
+
+        window.__PDF_VIEWER_BOOT__ = {
+          state: state,
+          urls: function () {
+            return {
+              script: state.scriptUrl,
+              worker: state.workerUrl,
+              cmap: joinUrl(state.effectiveBase, CMAP_REL),
+              font: joinUrl(state.effectiveBase, FONT_REL),
+            };
+          },
+          retry: function () { loadPdfjs(); },
+          applyOverride: applyOverride,
+          clearOverride: clearOverride,
+          normalizeBase: function (input) { return normalizeBase(input); },
+          probe: probe,
+        };
+
+        loadPdfjs();
+      })();
     </script>
   </head>
   <body>

@@ -1,8 +1,10 @@
 /**
  * PDF 渲染引擎 — 基于 PDF.js 2.10.377
- * PDF.js 通过 index.html 中的 <script> 标签加载到 window.pdfjsLib
+ * PDF.js 由 index.html 中的引导脚本加载到 window.pdfjsLib；
+ * 脚本地址 / worker / cMap / 标准字体地址统一由 runtime-config 按部署位置解析。
  * 2.x UMD 版本无 private class fields，彻底避免 Vite 兼容性问题
  */
+import { whenPdfjsReady, getPdfjsLib, resourceUrls } from './runtime-config'
 
 /* ------------------------------------------------------------------ */
 /*  PDF.js 2.x 类型定义（无需 @types/pdfjs-dist，手动声明核心接口）       */
@@ -99,27 +101,30 @@ interface PdfjsLinkService {
   isInPresentationMode: boolean
 }
 
+/** PDF.js 库（引导脚本加载到 window.pdfjsLib） */
+export interface PdfjsLib {
+  GlobalWorkerOptions: { workerSrc: string }
+  getDocument(params: Record<string, unknown>): { promise: Promise<PdfjsDocument> }
+  renderTextLayer(params: {
+    textContent: PdfjsTextContent
+    container: HTMLDivElement
+    viewport: PdfjsViewport
+    enhanceTextSelection?: boolean
+  }): void
+  AnnotationLayer: {
+    render(params: {
+      annotations: PdfjsAnnotation[]
+      div: HTMLDivElement
+      page: PdfjsPage
+      viewport: PdfjsViewport
+      linkService: PdfjsLinkService
+    }): void
+  }
+}
+
 declare global {
   interface Window {
-    pdfjsLib?: {
-      GlobalWorkerOptions: { workerSrc: string }
-      getDocument(params: Record<string, unknown>): { promise: Promise<PdfjsDocument> }
-      renderTextLayer(params: {
-        textContent: PdfjsTextContent
-        container: HTMLDivElement
-        viewport: PdfjsViewport
-        enhanceTextSelection?: boolean
-      }): void
-      AnnotationLayer: {
-        render(params: {
-          annotations: PdfjsAnnotation[]
-          div: HTMLDivElement
-          page: PdfjsPage
-          viewport: PdfjsViewport
-          linkService: PdfjsLinkService
-        }): void
-      }
-    }
+    pdfjsLib?: PdfjsLib
   }
 }
 
@@ -127,25 +132,12 @@ declare global {
 /*  初始化                                                              */
 /* ------------------------------------------------------------------ */
 
-let _resolve: () => void
-const pdfjsReady = new Promise<void>((resolve) => {
-  _resolve = resolve
-})
-
-if (window.pdfjsLib) {
-  _resolve!()
-} else {
-  window.addEventListener('pdfjs-ready', () => _resolve(), { once: true })
+function getPdfjs(): PdfjsLib {
+  return getPdfjsLib<PdfjsLib>()
 }
 
-function getPdfjs() {
-  const lib = window.pdfjsLib
-  if (!lib) throw new Error('PDF.js not loaded')
-  return lib
-}
-
-async function ensureReady() {
-  await pdfjsReady
+async function ensureReady(): Promise<PdfjsLib> {
+  await whenPdfjsReady()
   return getPdfjs()
 }
 
@@ -164,14 +156,15 @@ export async function preloadPdfjs(): Promise<void> {
   await ensureReady()
 }
 
-/** 加载 PDF 文档 */
+/** 加载 PDF 文档（cMap/字体地址实时取当前生效配置，本地文件同样需要） */
 export async function loadPdfDocument(url: string): Promise<PdfjsDocument> {
   const pdfjs = await ensureReady()
+  const assets = resourceUrls()
   return pdfjs.getDocument({
     url,
-    cMapUrl: '/pdfjs/cmaps/',
+    cMapUrl: assets.cmap,
     cMapPacked: true,
-    standardFontDataUrl: '/pdfjs/standard_fonts/',
+    standardFontDataUrl: assets.font,
   }).promise
 }
 

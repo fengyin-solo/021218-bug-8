@@ -6,7 +6,7 @@
           v-for="s in sampleFiles" :key="s.name"
           class="toolbar__sample-btn"
           :class="{ 'toolbar__sample-btn--active': fileName === s.name }"
-          :disabled="loading"
+          :disabled="loading || bootStatus !== 'ready'"
           @click="loadSample(s.name)"
         >{{ s.label }}</button>
         <div class="toolbar__divider" v-if="totalPages > 0" />
@@ -93,7 +93,20 @@
         </button>
       </div>
       <div class="toolbar__right">
+        <span
+          class="toolbar__boot-status"
+          :class="`toolbar__boot-status--${bootStatus}`"
+          :title="bootStatusTitle"
+        >
+          <span class="toolbar__boot-dot" />{{ bootStatusText }}
+        </span>
         <span class="toolbar__hint" v-if="totalPages > 0">可直接选中文字复制</span>
+        <button class="toolbar__btn" @click="showSettings = true" title="部署与资源设置">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="18" height="18">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -132,7 +145,7 @@
         </div>
       </aside>
       <div class="pdf-container" ref="containerRef" @scroll="onScroll">
-        <div class="pdf-empty" v-if="!pdfDoc && !loading">
+        <div class="pdf-empty" v-if="!pdfDoc && !loading && bootStatus === 'ready'">
           <label class="pdf-empty__card pdf-empty__card--clickable">
             <svg class="pdf-empty__icon" viewBox="0 0 64 64" fill="none">
               <rect x="12" y="4" width="40" height="56" rx="4" stroke="#d9d9d9" stroke-width="2"/>
@@ -143,6 +156,28 @@
             <p class="pdf-empty__sub">点击上方示例按钮，或拖拽本地 PDF 文件到此处</p>
             <input type="file" accept=".pdf" class="pdf-empty__input" @change="onFileChange" />
           </label>
+        </div>
+        <div class="pdf-boot-loading" v-if="bootStatus === 'loading' && !pdfDoc && !loading">
+          <div class="pdf-boot-loading__spinner"/>
+          <p class="pdf-boot-loading__text">正在加载 PDF.js 脚本...</p>
+          <p class="pdf-boot-loading__url">{{ bootUrls.script }}</p>
+        </div>
+        <div class="pdf-boot-error" v-else-if="bootStatus === 'error' && !pdfDoc">
+          <div class="pdf-boot-error__card">
+            <svg class="pdf-boot-error__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" width="48" height="48">
+              <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+            </svg>
+            <p class="pdf-boot-error__title">PDF.js 脚本加载失败</p>
+            <p class="pdf-boot-error__detail">{{ bootErrorMsg }}</p>
+            <p class="pdf-boot-error__sub">
+              阅读器部署在站点子目录时，脚本、字符集与字体地址需要与部署位置一致。
+              可在设置中检查当前生效地址并测试连通性。
+            </p>
+            <div class="pdf-boot-error__actions">
+              <button class="pdf-boot-error__btn pdf-boot-error__btn--primary" @click="retryPdfjs">重试加载</button>
+              <button class="pdf-boot-error__btn" @click="showSettings = true">打开设置</button>
+            </div>
+          </div>
         </div>
         <div class="pdf-loading" v-if="loading">
           <div class="pdf-loading__spinner"/>
@@ -158,6 +193,14 @@
             <p class="pdf-error__text">{{ errorMsg }}</p>
             <button class="pdf-error__btn" @click="errorMsg = ''">关闭</button>
           </div>
+        </div>
+        <div
+          v-if="bootStatus === 'error' && pdfDoc"
+          class="pdf-boot-banner"
+        >
+          <span>新地址的 PDF.js 加载失败，当前文档仍可正常查看；打开其他文档将受影响。</span>
+          <button class="pdf-boot-banner__btn" @click="retryPdfjs">重试</button>
+          <button class="pdf-boot-banner__btn" @click="showSettings = true">设置</button>
         </div>
         <div class="pdf-pages" v-show="pdfDoc && !loading">
           <div v-for="pageNum in totalPages" :key="pageNum" class="pdf-page-wrapper"
@@ -179,6 +222,7 @@
     <Transition name="toast">
       <div class="toast" v-if="toastMsg" :class="`toast--${toastType}`">{{ toastMsg }}</div>
     </Transition>
+    <SettingsDialog v-if="showSettings" @close="showSettings = false" />
   </div>
 </template>
 
@@ -191,6 +235,31 @@ import {
   type PdfjsDocument, type PdfjsPage, type PdfjsViewport,
   type SearchResult, type SearchMatch, type PageSearchResult,
 } from '@/utils/pdf-engine'
+import { useRuntimeConfig } from '@/utils/runtime-config'
+import SettingsDialog from '@/components/SettingsDialog.vue'
+
+const {
+  status: bootStatus, bootError, urls: bootUrls,
+  retryPdfjs, publicAssetUrl,
+} = useRuntimeConfig()
+
+const showSettings = ref(false)
+
+const bootStatusText = computed(() => {
+  if (bootStatus.value === 'ready') return 'PDF.js 就绪'
+  if (bootStatus.value === 'loading') return 'PDF.js 加载中'
+  return 'PDF.js 加载失败'
+})
+
+const bootErrorMsg = computed(() => bootError.value || '未知错误')
+
+const bootStatusTitle = computed(() => {
+  if (bootStatus.value === 'error') {
+    return `${bootError.value || 'PDF.js 加载失败'}（点击设置按钮可修改资源地址）`
+  }
+  if (bootStatus.value === 'loading') return `正在加载：${bootUrls.value.script}`
+  return 'PDF.js 已就绪，点击设置可查看资源地址'
+})
 
 const sampleFiles = [
   { name: 'sample.pdf', label: '示例一：学术论文' },
@@ -702,7 +771,7 @@ async function loadPdf(url: string) {
 
 function loadSample(name: string) {
   fileName.value = name
-  loadPdf(`/${name}`)
+  loadPdf(publicAssetUrl(name))
 }
 
 function onFileChange(e: Event) {
@@ -725,7 +794,8 @@ function onDrop(e: DragEvent) {
 onMounted(() => {
   document.addEventListener('dragover', onDragOver)
   document.addEventListener('drop', onDrop)
-  preloadPdfjs().catch(() => {})
+  /* 就绪/失败状态由引导层界面直接呈现，这里仅保留日志，不再吞掉后无限等待 */
+  preloadPdfjs().catch((e) => { console.warn('PDF.js 未就绪:', e) })
 })
 
 onUnmounted(() => {
@@ -845,6 +915,70 @@ onUnmounted(() => {
   &__text { color: var(--text-secondary); }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+.pdf-boot-loading {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  height: 100%; gap: 10px; padding: 32px;
+  &__spinner {
+    width: 40px; height: 40px; border: 3px solid var(--border-color);
+    border-top-color: var(--primary-color); border-radius: 50%; animation: spin 0.8s linear infinite;
+  }
+  &__text { color: var(--text-secondary); margin: 0; }
+  &__url {
+    margin: 0; font-size: var(--font-size-sm); color: var(--text-tertiary);
+    word-break: break-all; text-align: center; max-width: 560px;
+  }
+}
+.pdf-boot-error {
+  display: flex; align-items: center; justify-content: center; padding: 48px;
+  &__card {
+    display: flex; flex-direction: column; align-items: center; gap: 12px;
+    padding: 32px 48px; background: #fff2f0; border: 1px solid #ffccc7;
+    border-radius: var(--radius-md); max-width: 560px; text-align: center;
+  }
+  &__icon { color: #ff4d4f; flex-shrink: 0; }
+  &__title { margin: 0; font-size: 16px; font-weight: 600; color: #cf1322; }
+  &__detail {
+    margin: 0; font-size: var(--font-size-sm); color: #cf1322;
+    word-break: break-all; line-height: 1.5;
+  }
+  &__sub {
+    margin: 0; font-size: var(--font-size-sm); color: var(--text-secondary); line-height: 1.6;
+  }
+  &__actions { display: flex; gap: 12px; margin-top: 4px; }
+  &__btn {
+    padding: 6px 24px; background: var(--card-bg); border: 1px solid var(--border-color);
+    border-radius: var(--radius-sm); cursor: pointer; transition: all 0.2s;
+    &:hover { border-color: var(--primary-color); color: var(--primary-color); }
+    &--primary { background: var(--primary-color); border-color: var(--primary-color); color: #fff;
+      &:hover { opacity: 0.85; color: #fff; }
+    }
+  }
+}
+.pdf-boot-banner {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 12px auto 0; max-width: 720px; padding: 8px 14px;
+  background: #fffbe6; border: 1px solid #ffe58f; border-radius: var(--radius-sm);
+  font-size: var(--font-size-sm); color: #ad6800;
+  &__btn {
+    padding: 2px 12px; font-size: var(--font-size-sm); cursor: pointer;
+    border: 1px solid #ffd591; border-radius: var(--radius-sm);
+    background: var(--card-bg); color: #ad6800;
+    &:hover { border-color: var(--primary-color); color: var(--primary-color); }
+  }
+}
+.toolbar__boot-status {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: var(--font-size-sm); white-space: nowrap;
+  color: var(--text-tertiary);
+  &--ready { color: #389e0d; }
+  &--loading { color: #d48806; }
+  &--error { color: #cf1322; font-weight: 500; cursor: pointer; }
+}
+.toolbar__boot-dot {
+  width: 8px; height: 8px; border-radius: 50%; background: currentColor;
+}
+.toolbar__boot-status--loading .toolbar__boot-dot { animation: status-blink 1s ease-in-out infinite; }
+@keyframes status-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
 .pdf-error {
   display: flex; align-items: center; justify-content: center; padding: 48px;
   &__card {

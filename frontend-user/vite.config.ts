@@ -3,6 +3,9 @@ import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
 
 export default defineConfig({
+  // 相对路径构建：同一份产物部署在站点根目录或任意子目录均可，
+  // PDF.js 等 public 资源的地址由 index.html 引导脚本按部署位置自动计算。
+  base: './',
   plugins: [vue()],
   resolve: {
     alias: {
